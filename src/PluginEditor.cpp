@@ -61,6 +61,7 @@ IntersectEditor::IntersectEditor (IntersectProcessor& p)
 
     setWantsKeyboardFocus (true);
     setSize (kBaseW, kBaseH);
+    lastUiSnapshotVersion = processor.getUiSliceSnapshotVersion();
     startTimerHz (30);
 }
 
@@ -249,6 +250,14 @@ bool IntersectEditor::keyPressed (const juce::KeyPress& key)
 void IntersectEditor::timerCallback()
 {
     waveformView.rebuildCacheIfNeeded();
+    bool uiChanged = false;
+
+    const auto snapshotVersion = processor.getUiSliceSnapshotVersion();
+    if (snapshotVersion != lastUiSnapshotVersion)
+    {
+        lastUiSnapshotVersion = snapshotVersion;
+        uiChanged = true;
+    }
 
     // Check if scale changed (lastScale starts at -1 so first tick always applies)
     float scale = processor.apvts.getRawParameterValue (ParamIds::uiScale)->load();
@@ -258,9 +267,21 @@ void IntersectEditor::timerCallback()
         setTransform (juce::AffineTransform::scale (scale));
         IntersectLookAndFeel::setMenuScale (scale);
         saveUserSettings (scale, getTheme().name);
+        uiChanged = true;
     }
 
-    repaint();
+    // Waveform cursor/playhead animation updates continuously.
+    waveformView.repaint();
+
+    // Other components only need repaint when snapshot/theme/scale changes.
+    if (uiChanged)
+    {
+        headerBar.repaint();
+        sliceLane.repaint();
+        scrollZoomBar.repaint();
+        sliceControlBar.repaint();
+        actionPanel.repaint();
+    }
 }
 
 void IntersectEditor::ensureDefaultThemes()

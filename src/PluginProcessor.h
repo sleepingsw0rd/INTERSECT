@@ -137,6 +137,11 @@ public:
         return uiSliceSnapshots[(size_t) uiSliceSnapshotIndex.load (std::memory_order_acquire)];
     }
 
+    uint32_t getUiSliceSnapshotVersion() const
+    {
+        return uiSnapshotVersion.load (std::memory_order_acquire);
+    }
+
     // Public state for UI access
     SampleData     sampleData;
     SliceManager   sliceManager;
@@ -187,17 +192,34 @@ private:
     void processMidi (const juce::MidiBuffer& midi);
     void requestSampleLoad (const juce::File& file, LoadKind kind);
     void clearVoicesBeforeSampleSwap();
+    void clampSlicesToSampleBounds();
     void publishUiSliceSnapshot();
     UndoManager::Snapshot makeSnapshot();
     void captureSnapshot();
     void restoreSnapshot (const UndoManager::Snapshot& snap);
+    bool enqueueOverflowCommand (Command cmd);
+    void drainOverflowCommands (bool& handledAny);
+    bool enqueueCoalescedCommand (const Command& cmd);
+    void drainCoalescedCommands (bool& handledAny);
 
     // Command FIFO
-    static constexpr int kFifoSize = 64;
+    static constexpr int kFifoSize = 256;
     std::array<Command, kFifoSize> commandBuffer;
     juce::AbstractFifo commandFifo { kFifoSize };
     std::atomic<uint32_t> droppedCommandCount { 0 };
     std::atomic<uint32_t> droppedCommandTotal { 0 };
+    std::atomic<uint32_t> droppedCriticalCommandTotal { 0 };
+    static constexpr int kOverflowFifoSize = 32;
+    std::array<Command, kOverflowFifoSize> overflowCommandBuffer {};
+    std::atomic<int> overflowReadIndex { 0 };
+    std::atomic<int> overflowWriteIndex { 0 };
+    std::atomic<bool> pendingSetSliceParam { false };
+    std::atomic<int> pendingSetSliceParamField { 0 };
+    std::atomic<float> pendingSetSliceParamValue { 0.0f };
+    std::atomic<bool> pendingSetSliceBounds { false };
+    std::atomic<int> pendingSetSliceBoundsIdx { -1 };
+    std::atomic<int> pendingSetSliceBoundsStart { 0 };
+    std::atomic<int> pendingSetSliceBoundsEnd { 0 };
 
     double currentSampleRate = 44100.0;
     bool gestureSnapshotCaptured = false;
@@ -211,6 +233,8 @@ private:
     std::atomic<FailedLoadResult*> completedLoadFailure { nullptr };
     std::array<UiSliceSnapshot, 2> uiSliceSnapshots {};
     std::atomic<int> uiSliceSnapshotIndex { 0 };
+    std::atomic<bool> uiSnapshotDirty { true };
+    std::atomic<uint32_t> uiSnapshotVersion { 0 };
 
     bool heldNotes[128] = {};
 

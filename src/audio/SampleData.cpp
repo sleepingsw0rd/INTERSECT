@@ -127,8 +127,14 @@ void SampleData::applyDecodedSample (std::unique_ptr<DecodedSample> decoded)
     view->peakMipmaps = peakMipmaps;
     view->fileName = loadedFileName;
     view->filePath = loadedFilePath;
+#if INTERSECT_HAS_STD_ATOMIC_SHARED_PTR
     snapshot.store (std::static_pointer_cast<const DecodedSample> (view),
                     std::memory_order_release);
+#else
+    std::atomic_store_explicit (&snapshot,
+                                std::static_pointer_cast<const DecodedSample> (view),
+                                std::memory_order_release);
+#endif
     loaded = true;
 }
 
@@ -150,7 +156,12 @@ void SampleData::clear()
         m.maxPeaks.clear();
         m.minPeaks.clear();
     }
+#if INTERSECT_HAS_STD_ATOMIC_SHARED_PTR
     snapshot.store (std::shared_ptr<const DecodedSample> {}, std::memory_order_release);
+#else
+    std::atomic_store_explicit (&snapshot, std::shared_ptr<const DecodedSample> {},
+                                std::memory_order_release);
+#endif
     loadedFileName.clear();
     loadedFilePath.clear();
     loaded = false;
@@ -158,7 +169,11 @@ void SampleData::clear()
 
 SampleData::SnapshotPtr SampleData::getSnapshot() const
 {
+#if INTERSECT_HAS_STD_ATOMIC_SHARED_PTR
     return snapshot.load (std::memory_order_acquire);
+#else
+    return std::atomic_load_explicit (&snapshot, std::memory_order_acquire);
+#endif
 }
 
 float SampleData::getInterpolatedSample (double pos, int channel) const

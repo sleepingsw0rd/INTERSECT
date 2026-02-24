@@ -122,8 +122,6 @@ void LazyChopEngine::stop (VoicePool& voicePool, SliceManager& /*sliceMgr*/)
     v.active = false;
     v.stretchActive = false;
     v.bungeeActive = false;
-    v.stretcher.reset();
-    v.bungeeStretcher.reset();
 
     active = false;
     playing = false;

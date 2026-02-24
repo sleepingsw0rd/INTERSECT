@@ -81,6 +81,34 @@ static Slice sanitiseRestoredSlice (Slice s)
     s.lockMask &= kValidLockMask;
     return s;
 }
+
+static bool isCoalescableCommand (IntersectProcessor::CommandType type)
+{
+    return type == IntersectProcessor::CmdSetSliceParam
+        || type == IntersectProcessor::CmdSetSliceBounds;
+}
+
+static bool isCriticalCommand (IntersectProcessor::CommandType type)
+{
+    switch (type)
+    {
+        case IntersectProcessor::CmdLoadFile:
+        case IntersectProcessor::CmdCreateSlice:
+        case IntersectProcessor::CmdDeleteSlice:
+        case IntersectProcessor::CmdDuplicateSlice:
+        case IntersectProcessor::CmdSplitSlice:
+        case IntersectProcessor::CmdTransientChop:
+        case IntersectProcessor::CmdRelinkFile:
+        case IntersectProcessor::CmdUndo:
+        case IntersectProcessor::CmdRedo:
+        case IntersectProcessor::CmdPanic:
+        case IntersectProcessor::CmdSelectSlice:
+        case IntersectProcessor::CmdSetRootNote:
+            return true;
+        default:
+            return false;
+    }
+}
 } // namespace
 
 IntersectProcessor::IntersectProcessor()
@@ -239,12 +267,27 @@ void IntersectProcessor::clearVoicesBeforeSampleSwap()
     {
         auto& v = voicePool.getVoice (vi);
         v.active = false;
-        v.stretcher.reset();
-        v.bungeeStretcher.reset();
         voicePool.voicePositions[vi].store (0.0f,
             vi == VoicePool::kPreviewVoiceIndex
                 ? std::memory_order_release
                 : std::memory_order_relaxed);
+    }
+}
+
+void IntersectProcessor::clampSlicesToSampleBounds()
+{
+    const int maxLen = sampleData.getNumFrames();
+    if (maxLen <= 1)
+        return;
+
+    const int numSlices = sliceManager.getNumSlices();
+    for (int i = 0; i < numSlices; ++i)
+    {
+        auto& s = sliceManager.getSlice (i);
+        s.startSample = juce::jlimit (0, maxLen - 1, s.startSample);
+        s.endSample = juce::jlimit (s.startSample + 1, maxLen, s.endSample);
+        if (s.endSample - s.startSample < 64)
+            s.endSample = juce::jmin (maxLen, s.startSample + 64);
     }
 }
 
@@ -263,6 +306,8 @@ void IntersectProcessor::publishUiSliceSnapshot()
         snap.sampleFileName = sampleSnap->fileName;
     else if (snap.sampleMissing && missingFilePath.isNotEmpty())
         snap.sampleFileName = juce::File (missingFilePath).getFileName();
+    else if (sampleData.getFileName().isNotEmpty())
+        snap.sampleFileName = sampleData.getFileName();
     else
         snap.sampleFileName.clear();
 
@@ -275,24 +320,130 @@ void IntersectProcessor::publishUiSliceSnapshot()
     }
 
     uiSliceSnapshotIndex.store (writeIndex, std::memory_order_release);
+    uiSnapshotVersion.fetch_add (1, std::memory_order_release);
+    uiSnapshotDirty.store (false, std::memory_order_release);
 }
 
 void IntersectProcessor::pushCommand (Command cmd)
 {
+    const bool critical = isCriticalCommand (cmd.type);
     const auto scope = commandFifo.write (1);
     if (scope.blockSize1 > 0)
-        commandBuffer[(size_t) scope.startIndex1] = std::move (cmd);
-    else if (scope.blockSize2 > 0)
-        commandBuffer[(size_t) scope.startIndex2] = std::move (cmd);
-    else
     {
-        droppedCommandCount.fetch_add (1, std::memory_order_relaxed);
-        droppedCommandTotal.fetch_add (1, std::memory_order_relaxed);
+        commandBuffer[(size_t) scope.startIndex1] = std::move (cmd);
+        uiSnapshotDirty.store (true, std::memory_order_release);
+        return;
+    }
+    if (scope.blockSize2 > 0)
+    {
+        commandBuffer[(size_t) scope.startIndex2] = std::move (cmd);
+        uiSnapshotDirty.store (true, std::memory_order_release);
+        return;
+    }
+
+    if (enqueueCoalescedCommand (cmd))
+    {
+        uiSnapshotDirty.store (true, std::memory_order_release);
+        return;
+    }
+
+    if (critical && enqueueOverflowCommand (std::move (cmd)))
+    {
+        uiSnapshotDirty.store (true, std::memory_order_release);
+        return;
+    }
+
+    droppedCommandCount.fetch_add (1, std::memory_order_relaxed);
+    droppedCommandTotal.fetch_add (1, std::memory_order_relaxed);
+    if (critical)
+        droppedCriticalCommandTotal.fetch_add (1, std::memory_order_relaxed);
+}
+
+bool IntersectProcessor::enqueueOverflowCommand (Command cmd)
+{
+    const int write = overflowWriteIndex.load (std::memory_order_relaxed);
+    const int read = overflowReadIndex.load (std::memory_order_acquire);
+    const int next = (write + 1) % kOverflowFifoSize;
+    if (next == read)
+        return false;
+
+    overflowCommandBuffer[(size_t) write] = std::move (cmd);
+    overflowWriteIndex.store (next, std::memory_order_release);
+    return true;
+}
+
+void IntersectProcessor::drainOverflowCommands (bool& handledAny)
+{
+    for (;;)
+    {
+        const int read = overflowReadIndex.load (std::memory_order_relaxed);
+        const int write = overflowWriteIndex.load (std::memory_order_acquire);
+        if (read == write)
+            break;
+
+        handleCommand (overflowCommandBuffer[(size_t) read]);
+        overflowReadIndex.store ((read + 1) % kOverflowFifoSize, std::memory_order_release);
+        handledAny = true;
+    }
+}
+
+bool IntersectProcessor::enqueueCoalescedCommand (const Command& cmd)
+{
+    if (! isCoalescableCommand (cmd.type))
+        return false;
+
+    if (cmd.type == CmdSetSliceParam)
+    {
+        pendingSetSliceParamField.store (cmd.intParam1, std::memory_order_relaxed);
+        pendingSetSliceParamValue.store (cmd.floatParam1, std::memory_order_relaxed);
+        pendingSetSliceParam.store (true, std::memory_order_release);
+        return true;
+    }
+
+    if (cmd.type == CmdSetSliceBounds)
+    {
+        const int end = cmd.numPositions > 0 ? cmd.positions[0] : (int) cmd.floatParam1;
+        pendingSetSliceBoundsIdx.store (cmd.intParam1, std::memory_order_relaxed);
+        pendingSetSliceBoundsStart.store (cmd.intParam2, std::memory_order_relaxed);
+        pendingSetSliceBoundsEnd.store (end, std::memory_order_relaxed);
+        pendingSetSliceBounds.store (true, std::memory_order_release);
+        return true;
+    }
+
+    return false;
+}
+
+void IntersectProcessor::drainCoalescedCommands (bool& handledAny)
+{
+    if (pendingSetSliceBounds.exchange (false, std::memory_order_acq_rel))
+    {
+        Command cmd;
+        cmd.type = CmdSetSliceBounds;
+        cmd.intParam1 = pendingSetSliceBoundsIdx.load (std::memory_order_relaxed);
+        cmd.intParam2 = pendingSetSliceBoundsStart.load (std::memory_order_relaxed);
+        cmd.positions[0] = pendingSetSliceBoundsEnd.load (std::memory_order_relaxed);
+        cmd.numPositions = 1;
+        handleCommand (cmd);
+        handledAny = true;
+    }
+
+    if (pendingSetSliceParam.exchange (false, std::memory_order_acq_rel))
+    {
+        Command cmd;
+        cmd.type = CmdSetSliceParam;
+        cmd.intParam1 = pendingSetSliceParamField.load (std::memory_order_relaxed);
+        cmd.floatParam1 = pendingSetSliceParamValue.load (std::memory_order_relaxed);
+        handleCommand (cmd);
+        handledAny = true;
     }
 }
 
 void IntersectProcessor::drainCommands()
 {
+    bool handledAny = false;
+
+    drainOverflowCommands (handledAny);
+
     const auto scope = commandFifo.read (commandFifo.getNumReady());
 
     for (int i = 0; i < scope.blockSize1; ++i)
@@ -300,8 +451,16 @@ void IntersectProcessor::drainCommands()
     for (int i = 0; i < scope.blockSize2; ++i)
         handleCommand (commandBuffer[(size_t) (scope.startIndex2 + i)]);
 
+    if (scope.blockSize1 + scope.blockSize2 > 0)
+        handledAny = true;
+
+    drainCoalescedCommands (handledAny);
+
+    if (handledAny)
+        uiSnapshotDirty.store (true, std::memory_order_release);
+
     const auto dropped = droppedCommandCount.exchange (0, std::memory_order_relaxed);
-    if (scope.blockSize1 + scope.blockSize2 > 0 || dropped > 0)
+    if (handledAny || dropped > 0)
         updateHostDisplay (ChangeDetails().withNonParameterStateChanged (true));
 }
 
@@ -335,6 +494,7 @@ void IntersectProcessor::restoreSnapshot (const UndoManager::Snapshot& snap)
     midiSelectsSlice.store (snap.midiSelectsSlice);
     snapToZeroCrossing.store (snap.snapToZeroCrossing);
     sliceManager.rebuildMidiMap();
+    uiSnapshotDirty.store (true, std::memory_order_release);
 }
 
 void IntersectProcessor::handleCommand (const Command& cmd)
@@ -725,7 +885,12 @@ void IntersectProcessor::processMidi (const juce::MidiBuffer& midi)
                 // Any MIDI note places a chop boundary at the playhead
                 int newSliceIdx = lazyChop.onNote (note, voicePool, sliceManager);
                 if (midiSelectsSlice.load (std::memory_order_relaxed) && newSliceIdx >= 0)
-                    sliceManager.selectedSlice = newSliceIdx;
+                {
+                    const int previous = sliceManager.selectedSlice.load (std::memory_order_relaxed);
+                    sliceManager.selectedSlice.store (newSliceIdx, std::memory_order_relaxed);
+                    if (previous != newSliceIdx)
+                        uiSnapshotDirty.store (true, std::memory_order_release);
+                }
             }
             else
             {
@@ -760,7 +925,12 @@ void IntersectProcessor::processMidi (const juce::MidiBuffer& midi)
                 for (int sliceIdx : sliceIndices)
                 {
                     if (midiSelectsSlice.load (std::memory_order_relaxed))
-                        sliceManager.selectedSlice = sliceIdx;
+                    {
+                        const int previous = sliceManager.selectedSlice.load (std::memory_order_relaxed);
+                        sliceManager.selectedSlice.store (sliceIdx, std::memory_order_relaxed);
+                        if (previous != sliceIdx)
+                            uiSnapshotDirty.store (true, std::memory_order_release);
+                    }
 
                     int voiceIdx = voicePool.allocate();
 
@@ -850,8 +1020,12 @@ void IntersectProcessor::processBlock (juce::AudioBuffer<float>& buffer,
             if (latestLoadKind.load (std::memory_order_acquire) == (int) LoadKindReplace)
                 sliceManager.clearAll();
             else
+            {
+                clampSlicesToSampleBounds();
                 sliceManager.rebuildMidiMap();
+            }
             loadStateChanged = true;
+            uiSnapshotDirty.store (true, std::memory_order_release);
         }
     }
 
@@ -870,6 +1044,7 @@ void IntersectProcessor::processBlock (juce::AudioBuffer<float>& buffer,
                 sampleAvailability.store ((int) SampleStateMissingAwaitingRelink,
                                          std::memory_order_relaxed);
                 loadStateChanged = true;
+                uiSnapshotDirty.store (true, std::memory_order_release);
             }
         }
     }
@@ -878,7 +1053,6 @@ void IntersectProcessor::processBlock (juce::AudioBuffer<float>& buffer,
         updateHostDisplay (ChangeDetails().withNonParameterStateChanged (true));
 
     drainCommands();
-    publishUiSliceSnapshot();
 
     if (gestureSnapshotCaptured)
     {
@@ -891,6 +1065,9 @@ void IntersectProcessor::processBlock (juce::AudioBuffer<float>& buffer,
     voicePool.setMaxActiveVoices ((int) maxVoicesParam->load());
 
     processMidi (midi);
+
+    if (uiSnapshotDirty.exchange (false, std::memory_order_acq_rel))
+        publishUiSliceSnapshot();
 
     if (! sampleData.isLoaded())
     {
@@ -1122,44 +1299,22 @@ void IntersectProcessor::setStateInformation (const void* data, int sizeInBytes)
     auto filePath = stream.readString();
     auto fileName = stream.readString();
 
+    clearVoicesBeforeSampleSwap();
+    sampleData.clear();
+
     if (filePath.isNotEmpty())
     {
-        juce::File f (filePath);
-        double sr = currentSampleRate > 0 ? currentSampleRate : 44100.0;
-        clearVoicesBeforeSampleSwap();
-        if (f.existsAsFile() && sampleData.loadFromFile (f, sr))
-        {
-            sampleMissing.store (false);
-            missingFilePath.clear();
-            sampleAvailability.store ((int) SampleStateLoaded, std::memory_order_relaxed);
-            const int maxLen = sampleData.getNumFrames();
-            if (maxLen > 1)
-            {
-                for (int i = 0; i < validatedNumSlices; ++i)
-                {
-                    auto& s = sliceManager.getSlice (i);
-                    s.startSample = juce::jlimit (0, maxLen - 1, s.startSample);
-                    s.endSample = juce::jlimit (s.startSample + 1, maxLen, s.endSample);
-                    if (s.endSample - s.startSample < 64)
-                        s.endSample = juce::jmin (maxLen, s.startSample + 64);
-                }
-            }
-        }
-        else
-        {
-            sampleData.clear();
-            sampleMissing.store (true);
-            missingFilePath = filePath;
-            sampleData.setFileName (fileName);
-            sampleData.setFilePath (filePath);
-            sampleAvailability.store ((int) SampleStateMissingAwaitingRelink,
-                                     std::memory_order_relaxed);
-        }
+        const juce::File restoredFile (filePath);
+        sampleMissing.store (false);
+        missingFilePath.clear();
+        sampleData.setFileName (fileName.isNotEmpty() ? fileName : restoredFile.getFileName());
+        sampleData.setFilePath (filePath);
+        sampleAvailability.store ((int) SampleStateEmpty, std::memory_order_relaxed);
+        // Preserve restored slices while loading, and report missing path via relink state.
+        requestSampleLoad (restoredFile, LoadKindRelink);
     }
     else
     {
-        clearVoicesBeforeSampleSwap();
-        sampleData.clear();
         sampleMissing.store (false);
         missingFilePath.clear();
         sampleData.setFileName ({});
@@ -1175,5 +1330,5 @@ void IntersectProcessor::setStateInformation (const void* data, int sizeInBytes)
 
 juce::AudioProcessor* JUCE_CALLTYPE createPluginFilter()
 {
-    return new IntersectProcessor();
+    return static_cast<juce::AudioProcessor*> (new IntersectProcessor());
 }

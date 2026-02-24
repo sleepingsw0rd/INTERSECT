@@ -32,6 +32,7 @@ private:
     IntersectProcessor& processor;
     float lastScale = -1.0f;  // sentinel so first timer tick always applies
     float savedScale = -1.0f;
+    uint32_t lastUiSnapshotVersion = 0;
 
     IntersectLookAndFeel lnf;
     HeaderBar       headerBar;

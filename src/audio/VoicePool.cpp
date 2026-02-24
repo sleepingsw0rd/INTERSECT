@@ -10,6 +10,9 @@
 #include <cmath>
 
 static constexpr int kStretchBlockSize = 128;
+static constexpr int kMaxStretchInputSamples = 8192;
+static constexpr int kMaxBungeeInputFrames = 8192;
+static constexpr int kMaxBungeeOutputFrames = 8192;
 
 static inline float dbToLinear (float dB)
 {
@@ -21,6 +24,19 @@ VoicePool::VoicePool()
 {
     for (auto& p : voicePositions)
         p.store (0.0f, std::memory_order_relaxed);
+
+    for (auto& v : voices)
+    {
+        v.stretchInBufL.resize (kMaxStretchInputSamples);
+        v.stretchInBufR.resize (kMaxStretchInputSamples);
+        v.stretchOutBufL.resize (kStretchBlockSize);
+        v.stretchOutBufR.resize (kStretchBlockSize);
+        v.bungeeInputBuf.resize ((size_t) kMaxBungeeInputFrames * 2);
+        v.bungeeOutBufL.resize (kMaxBungeeOutputFrames);
+        v.bungeeOutBufR.resize (kMaxBungeeOutputFrames);
+        v.bungeePPFadeL.resize ((size_t) v.bungeePPFadeLen);
+        v.bungeePPFadeR.resize ((size_t) v.bungeePPFadeLen);
+    }
 }
 
 int VoicePool::allocate()
@@ -61,8 +77,6 @@ void VoicePool::setMaxActiveVoices (int n)
         {
             if (i == previewIdx) continue;
             voices[i].active = false;
-            voices[i].stretcher.reset();
-            voices[i].bungeeStretcher.reset();
             voicePositions[i].store (0.0f, std::memory_order_relaxed);
         }
     }
@@ -76,7 +90,8 @@ void VoicePool::initStretcher (Voice& v, float pitchSemis, double sr,
     int blockSize = std::max (256, (int)(sr * 0.023));   // ~1024 @ 44.1k (~23ms)
     int interval  = std::max (64,  (int)(sr * 0.006));   // ~256 @ 44.1k (~6ms)
 
-    v.stretcher = std::make_shared<signalsmith::stretch::SignalsmithStretch<float, void>>();
+    if (! v.stretcher)
+        v.stretcher = std::make_shared<signalsmith::stretch::SignalsmithStretch<float, void>>();
     v.stretcher->configure (2, blockSize, interval, false);
 
     float tonalityLimit = (tonalityHz > 0.0f && sr > 0.0) ? (float)(tonalityHz / sr) : 0.0f;
@@ -85,10 +100,6 @@ void VoicePool::initStretcher (Voice& v, float pitchSemis, double sr,
     if (formantSemis != 0.0f || formantComp)
         v.stretcher->setFormantSemitones (formantSemis, formantComp);
 
-    v.stretchInBufL.resize (kStretchBlockSize);
-    v.stretchInBufR.resize (kStretchBlockSize);
-    v.stretchOutBufL.resize (kStretchBlockSize);
-    v.stretchOutBufR.resize (kStretchBlockSize);
     v.stretchOutReadPos = 0;
     v.stretchOutAvail = 0;
 
@@ -96,21 +107,21 @@ void VoicePool::initStretcher (Voice& v, float pitchSemis, double sr,
     float playbackRate = v.stretchTimeRatio;
     int seekLen = v.stretcher->outputSeekLength (playbackRate);
     seekLen = std::min (seekLen, v.endSample - v.startSample);
+    seekLen = juce::jlimit (0, (int) v.stretchInBufL.size(), seekLen);
 
     int maxFrame = sample.getNumFrames() - 1;
     if (seekLen > 0 && sample.isLoaded() && maxFrame >= 0)
     {
-        std::vector<float> seekL ((size_t) seekLen), seekR ((size_t) seekLen);
         for (int i = 0; i < seekLen; ++i)
         {
             int srcIdx = (v.direction > 0)
                 ? v.startSample + i
                 : v.endSample - 1 - i;
             srcIdx = juce::jlimit (0, maxFrame, srcIdx);
-            seekL[(size_t) i] = sample.getInterpolatedSample (srcIdx, 0);
-            seekR[(size_t) i] = sample.getInterpolatedSample (srcIdx, 1);
+            v.stretchInBufL[(size_t) i] = sample.getInterpolatedSample (srcIdx, 0);
+            v.stretchInBufR[(size_t) i] = sample.getInterpolatedSample (srcIdx, 1);
         }
-        float* ptrs[2] = { seekL.data(), seekR.data() };
+        float* ptrs[2] = { v.stretchInBufL.data(), v.stretchInBufR.data() };
         v.stretcher->outputSeek (ptrs, seekLen);
         if (v.direction > 0)
             v.stretchSrcPos = v.startSample + seekLen;
@@ -129,14 +140,9 @@ void VoicePool::initBungee (Voice& v, float pitchSemis, double sr, int grainMode
     v.bungeeStretcher = std::make_shared<Bungee::Stretcher<Bungee::Basic>> (rates, 2, hopAdj);
 
     v.bungeePitch = std::pow (2.0, (double) pitchSemis / 12.0);
-    v.bungeeOutBufL.clear();
-    v.bungeeOutBufR.clear();
     v.bungeeOutReadPos = 0;
     v.bungeeOutAvail = 0;
     v.bungeePPFade = 0;
-
-    int maxIn = v.bungeeStretcher->maxInputFrameCount();
-    v.bungeeInputBuf.resize ((size_t) maxIn * 2);
 }
 
 void VoicePool::startVoice (int voiceIdx, const VoiceStartParams& p,
@@ -212,8 +218,8 @@ void VoicePool::startVoice (int voiceIdx, const VoiceStartParams& p,
     v.stretchActive  = false;
     v.bungeeActive   = false;
     v.bungeePPFade   = 0;
-    v.bungeePPFadeL.clear();
-    v.bungeePPFadeR.clear();
+    std::fill (v.bungeePPFadeL.begin(), v.bungeePPFadeL.end(), 0.0f);
+    std::fill (v.bungeePPFadeR.begin(), v.bungeePPFadeR.end(), 0.0f);
 
     if (stretchOn && p.dawBpm > 0.0f && sliceBpm > 0.0f)
     {
@@ -327,9 +333,10 @@ static void fillStretchBlock (Voice& v, const SampleData& sample)
 {
     int inputSamples = (int) (kStretchBlockSize * v.stretchTimeRatio);
     if (inputSamples < 1) inputSamples = 1;
-
-    v.stretchInBufL.resize ((size_t) inputSamples);
-    v.stretchInBufR.resize ((size_t) inputSamples);
+    const int maxInput = std::min ((int) v.stretchInBufL.size(), (int) v.stretchInBufR.size());
+    if (maxInput <= 0)
+        return;
+    inputSamples = juce::jlimit (1, maxInput, inputSamples);
 
     for (int i = 0; i < inputSamples; ++i)
     {
@@ -399,16 +406,22 @@ static void fillStretchBlock (Voice& v, const SampleData& sample)
         }
     }
 
-    v.stretchOutBufL.resize (kStretchBlockSize);
-    v.stretchOutBufR.resize (kStretchBlockSize);
+    const int outCapacity = std::min ((int) v.stretchOutBufL.size(), (int) v.stretchOutBufR.size());
+    if (outCapacity <= 0)
+    {
+        v.stretchOutReadPos = 0;
+        v.stretchOutAvail = 0;
+        return;
+    }
+    const int outputSamples = std::min (kStretchBlockSize, outCapacity);
 
     // Process through Signalsmith
     float* inPtrs[2]  = { v.stretchInBufL.data(), v.stretchInBufR.data() };
     float* outPtrs[2] = { v.stretchOutBufL.data(), v.stretchOutBufR.data() };
-    v.stretcher->process (inPtrs, inputSamples, outPtrs, kStretchBlockSize);
+    v.stretcher->process (inPtrs, inputSamples, outPtrs, outputSamples);
 
     v.stretchOutReadPos = 0;
-    v.stretchOutAvail = kStretchBlockSize;
+    v.stretchOutAvail = outputSamples;
 }
 
 static void fillBungeeBlock (Voice& v, const SampleData& sample)
@@ -458,8 +471,19 @@ static void fillBungeeBlock (Voice& v, const SampleData& sample)
     Bungee::InputChunk inputChunk = stretcher.specifyGrain (request);
 
     int numFrames = inputChunk.end - inputChunk.begin;
-    int maxIn = stretcher.maxInputFrameCount();
-    v.bungeeInputBuf.resize ((size_t) maxIn * 2);
+    const int maxIn = std::min (stretcher.maxInputFrameCount(),
+                                (int) (v.bungeeInputBuf.size() / 2));
+    if (maxIn <= 0 || numFrames <= 0)
+    {
+        v.bungeeOutReadPos = 0;
+        v.bungeeOutAvail = 0;
+        return;
+    }
+    if (numFrames > maxIn)
+    {
+        numFrames = maxIn;
+        inputChunk.end = inputChunk.begin + numFrames;
+    }
 
     // Determine effective end for reading (release tail allows reading past slice end)
     int effectiveEnd = v.releaseTail && !v.pingPong ? v.bufferEnd : v.endSample;
@@ -494,20 +518,25 @@ static void fillBungeeBlock (Voice& v, const SampleData& sample)
     int outFrames = outputChunk.frameCount;
     if (outFrames > 0)
     {
-        v.bungeeOutBufL.resize ((size_t) outFrames);
-        v.bungeeOutBufR.resize ((size_t) outFrames);
-
         const float* outData = outputChunk.data;
         intptr_t stride = outputChunk.channelStride;
+        const int outCapacity = std::min ((int) v.bungeeOutBufL.size(),
+                                          (int) v.bungeeOutBufR.size());
+        const int framesToCopy = std::min (outFrames, outCapacity);
 
-        for (int i = 0; i < outFrames; ++i)
+        for (int i = 0; i < framesToCopy; ++i)
         {
             v.bungeeOutBufL[(size_t) i] = outData[i];
             v.bungeeOutBufR[(size_t) i] = outData[stride + i];
         }
 
         v.bungeeOutReadPos = 0;
-        v.bungeeOutAvail = outFrames;
+        v.bungeeOutAvail = framesToCopy;
+    }
+    else
+    {
+        v.bungeeOutReadPos = 0;
+        v.bungeeOutAvail = 0;
     }
 
     // Advance source position
@@ -543,7 +572,6 @@ void VoicePool::processVoiceSample (int i, const SampleData& sample, double /*sr
         if (v.envelope.isDone())
         {
             v.active = false;
-            v.stretcher.reset();
             voicePositions[i].store (0.0f, std::memory_order_relaxed);
             return;
         }
@@ -600,7 +628,6 @@ void VoicePool::processVoiceSample (int i, const SampleData& sample, double /*sr
         if (v.envelope.isDone())
         {
             v.active = false;
-            v.bungeeStretcher.reset();
             voicePositions[i].store (0.0f, std::memory_order_relaxed);
             return;
         }
@@ -768,20 +795,31 @@ void VoicePool::startShiftPreview (int startSample, int bufferSize,
                                     double sr, const SampleData& /*sd*/)
 {
     // Shares the lazyChop preview slot; only called when lazyChop is inactive
-    int i = kPreviewVoiceIndex;
+    const int i = kPreviewVoiceIndex;
     Voice& v = voices[i];
-    v             = Voice{};
-    v.active      = true;
-    v.position    = (double) startSample;
+    v.active = true;
+    v.sliceIdx = -1;
+    v.position = (double) startSample;
+    v.speed = 1.0;
+    v.direction = 1;
+    v.midiNote = -1;
+    v.velocity = 0.8f;
     v.startSample = startSample;
-    v.endSample   = bufferSize;
-    v.bufferEnd   = bufferSize;
-    v.speed       = 1.0;
-    v.direction   = 1;
-    v.velocity    = 0.8f;
-    v.volume      = 1.0f;
-    v.midiNote    = -1;
-    v.sliceIdx    = -1;
+    v.endSample = bufferSize;
+    v.bufferEnd = bufferSize;
+    v.pingPong = false;
+    v.muteGroup = 0;
+    v.looping = false;
+    v.volume = 1.0f;
+    v.releaseTail = false;
+    v.oneShot = false;
+    v.stretchActive = false;
+    v.stretchOutReadPos = 0;
+    v.stretchOutAvail = 0;
+    v.bungeeActive = false;
+    v.bungeeOutReadPos = 0;
+    v.bungeeOutAvail = 0;
+    v.bungeePPFade = 0;
     v.envelope.noteOn (0.002f, 0.0f, 1.0f, 0.05f, sr);
     voicePositions[i].store ((float) startSample, std::memory_order_relaxed);
 }

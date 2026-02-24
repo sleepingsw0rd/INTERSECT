@@ -6,6 +6,12 @@
 #include <memory>
 #include <vector>
 
+#if defined(__cpp_lib_atomic_shared_ptr) && __cpp_lib_atomic_shared_ptr >= 201711L
+#define INTERSECT_HAS_STD_ATOMIC_SHARED_PTR 1
+#else
+#define INTERSECT_HAS_STD_ATOMIC_SHARED_PTR 0
+#endif
+
 class SampleData
 {
 public:
@@ -56,7 +62,11 @@ private:
 
     juce::AudioBuffer<float> buffer;  // always stereo
     std::array<PeakMipmap, kNumMipmapLevels> peakMipmaps;
+#if INTERSECT_HAS_STD_ATOMIC_SHARED_PTR
     std::atomic<std::shared_ptr<const DecodedSample>> snapshot;
+#else
+    std::shared_ptr<const DecodedSample> snapshot;
+#endif
     juce::String loadedFileName;
     juce::String loadedFilePath;
     bool loaded = false;
