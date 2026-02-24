@@ -48,6 +48,39 @@ private:
     SuccessFn onSuccess;
     FailureFn onFailure;
 };
+
+static constexpr uint32_t kValidLockMask =
+    kLockBpm | kLockPitch | kLockAlgorithm | kLockAttack | kLockDecay | kLockSustain
+    | kLockRelease | kLockMuteGroup | kLockStretch | kLockTonality | kLockFormant
+    | kLockFormantComp | kLockGrainMode | kLockVolume | kLockReleaseTail | kLockReverse
+    | kLockOutputBus | kLockLoop | kLockOneShot | kLockCentsDetune;
+
+static Slice sanitiseRestoredSlice (Slice s)
+{
+    s.startSample = juce::jmax (0, s.startSample);
+    s.endSample = juce::jmax (s.startSample + 1, s.endSample);
+    if (s.endSample - s.startSample < 64)
+        s.endSample = s.startSample + 64;
+
+    s.midiNote = juce::jlimit (0, 127, s.midiNote);
+    s.bpm = juce::jlimit (20.0f, 999.0f, s.bpm);
+    s.pitchSemitones = juce::jlimit (-24.0f, 24.0f, s.pitchSemitones);
+    s.algorithm = juce::jlimit (0, 2, s.algorithm);
+    s.attackSec = juce::jlimit (0.0f, 1.0f, s.attackSec);
+    s.decaySec = juce::jlimit (0.0f, 5.0f, s.decaySec);
+    s.sustainLevel = juce::jlimit (0.0f, 1.0f, s.sustainLevel);
+    s.releaseSec = juce::jlimit (0.0f, 5.0f, s.releaseSec);
+    s.muteGroup = juce::jlimit (0, 32, s.muteGroup);
+    s.loopMode = juce::jlimit (0, 2, s.loopMode);
+    s.tonalityHz = juce::jlimit (0.0f, 8000.0f, s.tonalityHz);
+    s.formantSemitones = juce::jlimit (-24.0f, 24.0f, s.formantSemitones);
+    s.grainMode = juce::jlimit (0, 2, s.grainMode);
+    s.volume = juce::jlimit (-100.0f, 24.0f, s.volume);
+    s.outputBus = juce::jlimit (0, 15, s.outputBus);
+    s.centsDetune = juce::jlimit (-100.0f, 100.0f, s.centsDetune);
+    s.lockMask &= kValidLockMask;
+    return s;
+}
 } // namespace
 
 IntersectProcessor::IntersectProcessor()
@@ -90,6 +123,7 @@ IntersectProcessor::IntersectProcessor()
     oneShotParam     = apvts.getRawParameterValue (ParamIds::defaultOneShot);
     maxVoicesParam   = apvts.getRawParameterValue (ParamIds::maxVoices);
     centsDetuneParam = apvts.getRawParameterValue (ParamIds::defaultCentsDetune);
+    publishUiSliceSnapshot();
 }
 
 IntersectProcessor::~IntersectProcessor()
@@ -97,6 +131,8 @@ IntersectProcessor::~IntersectProcessor()
     fileLoadPool.removeAllJobs (true, 5000);
     auto* pending = completedLoadData.exchange (nullptr, std::memory_order_acq_rel);
     delete pending;
+    auto* failed = completedLoadFailure.exchange (nullptr, std::memory_order_acq_rel);
+    delete failed;
 }
 
 bool IntersectProcessor::isBusesLayoutSupported (const BusesLayout& layouts) const
@@ -135,15 +171,19 @@ void IntersectProcessor::requestSampleLoad (const juce::File& file, LoadKind kin
     // Keep only the latest completed decode payload.
     auto* oldDecoded = completedLoadData.exchange (nullptr, std::memory_order_acq_rel);
     delete oldDecoded;
+    auto* oldFailure = completedLoadFailure.exchange (nullptr, std::memory_order_acq_rel);
+    delete oldFailure;
 
     if (! file.existsAsFile())
     {
         if (kind == LoadKindRelink)
         {
-            sampleMissing.store (true);
-            missingFilePath = file.getFullPathName();
-            sampleData.setFileName (file.getFileName());
-            sampleData.setFilePath (file.getFullPathName());
+            auto* payload = new FailedLoadResult();
+            payload->token = token;
+            payload->kind = kind;
+            payload->file = file;
+            auto* old = completedLoadFailure.exchange (payload, std::memory_order_acq_rel);
+            delete old;
         }
         return;
     }
@@ -166,15 +206,25 @@ void IntersectProcessor::requestSampleLoad (const juce::File& file, LoadKind kin
         if (finishedToken != latestLoadToken.load (std::memory_order_acquire))
             return;
 
-        Command failed;
-        failed.type = CmdFileLoadFailed;
-        failed.intParam1 = finishedToken;
-        failed.intParam2 = (int) finishedKind;
-        failed.fileParam = failedFile;
-        pushCommand (std::move (failed));
+        auto* payload = new FailedLoadResult();
+        payload->token = finishedToken;
+        payload->kind = finishedKind;
+        payload->file = failedFile;
+        auto* old = completedLoadFailure.exchange (payload, std::memory_order_acq_rel);
+        delete old;
     };
 
     fileLoadPool.addJob (new SampleDecodeJob (file, sr, token, kind, onSuccess, onFailure), true);
+}
+
+void IntersectProcessor::loadFileAsync (const juce::File& file)
+{
+    requestSampleLoad (file, LoadKindReplace);
+}
+
+void IntersectProcessor::relinkFileAsync (const juce::File& file)
+{
+    requestSampleLoad (file, LoadKindRelink);
 }
 
 void IntersectProcessor::clearVoicesBeforeSampleSwap()
@@ -196,6 +246,35 @@ void IntersectProcessor::clearVoicesBeforeSampleSwap()
                 ? std::memory_order_release
                 : std::memory_order_relaxed);
     }
+}
+
+void IntersectProcessor::publishUiSliceSnapshot()
+{
+    const int writeIndex = 1 - uiSliceSnapshotIndex.load (std::memory_order_relaxed);
+    auto& snap = uiSliceSnapshots[(size_t) writeIndex];
+    auto sampleSnap = sampleData.getSnapshot();
+    snap.numSlices = sliceManager.getNumSlices();
+    snap.selectedSlice = sliceManager.selectedSlice.load (std::memory_order_relaxed);
+    snap.rootNote = sliceManager.rootNote.load (std::memory_order_relaxed);
+    snap.sampleLoaded = (sampleSnap != nullptr);
+    snap.sampleMissing = sampleMissing.load (std::memory_order_relaxed);
+    snap.sampleNumFrames = sampleSnap ? sampleSnap->buffer.getNumSamples() : 0;
+    if (sampleSnap != nullptr)
+        snap.sampleFileName = sampleSnap->fileName;
+    else if (snap.sampleMissing && missingFilePath.isNotEmpty())
+        snap.sampleFileName = juce::File (missingFilePath).getFileName();
+    else
+        snap.sampleFileName.clear();
+
+    for (int i = 0; i < SliceManager::kMaxSlices; ++i)
+    {
+        if (i < snap.numSlices)
+            snap.slices[(size_t) i] = sliceManager.getSlice (i);
+        else
+            snap.slices[(size_t) i].active = false;
+    }
+
+    uiSliceSnapshotIndex.store (writeIndex, std::memory_order_release);
 }
 
 void IntersectProcessor::pushCommand (Command cmd)
@@ -300,7 +379,7 @@ void IntersectProcessor::handleCommand (const Command& cmd)
     switch (cmd.type)
     {
         case CmdLoadFile:
-            requestSampleLoad (cmd.fileParam, LoadKindReplace);
+            loadFileAsync (cmd.fileParam);
             break;
 
         case CmdCreateSlice:
@@ -579,7 +658,7 @@ void IntersectProcessor::handleCommand (const Command& cmd)
         }
 
         case CmdRelinkFile:
-            requestSampleLoad (cmd.fileParam, LoadKindRelink);
+            relinkFileAsync (cmd.fileParam);
             break;
 
         case CmdFileLoadFailed:
@@ -590,6 +669,8 @@ void IntersectProcessor::handleCommand (const Command& cmd)
                 missingFilePath = cmd.fileParam.getFullPathName();
                 sampleData.setFileName (cmd.fileParam.getFileName());
                 sampleData.setFilePath (cmd.fileParam.getFullPathName());
+                sampleAvailability.store ((int) SampleStateMissingAwaitingRelink,
+                                         std::memory_order_relaxed);
             }
             break;
 
@@ -610,6 +691,17 @@ void IntersectProcessor::handleCommand (const Command& cmd)
             voicePool.killAll();
             lazyChop.stop (voicePool, sliceManager);
             std::fill (std::begin (heldNotes), std::end (heldNotes), false);
+            break;
+
+        case CmdSelectSlice:
+            sliceManager.selectedSlice.store (
+                juce::jlimit (-1, juce::jmax (-1, sliceManager.getNumSlices() - 1), cmd.intParam1),
+                std::memory_order_relaxed);
+            break;
+
+        case CmdSetRootNote:
+            sliceManager.rootNote.store (juce::jlimit (0, 127, cmd.intParam1),
+                                         std::memory_order_relaxed);
             break;
 
         case CmdNone:
@@ -743,6 +835,7 @@ void IntersectProcessor::processBlock (juce::AudioBuffer<float>& buffer,
                                          currentSampleRate, sampleData);
     }
 
+    bool loadStateChanged = false;
     {
         auto* rawDecoded = completedLoadData.exchange (nullptr, std::memory_order_acq_rel);
         if (rawDecoded != nullptr)
@@ -752,15 +845,40 @@ void IntersectProcessor::processBlock (juce::AudioBuffer<float>& buffer,
             sampleData.applyDecodedSample (std::move (decoded));
             sampleMissing.store (false);
             missingFilePath.clear();
+            sampleAvailability.store ((int) SampleStateLoaded, std::memory_order_relaxed);
 
             if (latestLoadKind.load (std::memory_order_acquire) == (int) LoadKindReplace)
                 sliceManager.clearAll();
             else
                 sliceManager.rebuildMidiMap();
+            loadStateChanged = true;
         }
     }
 
+    {
+        auto* rawFailure = completedLoadFailure.exchange (nullptr, std::memory_order_acq_rel);
+        if (rawFailure != nullptr)
+        {
+            std::unique_ptr<FailedLoadResult> failed (rawFailure);
+            if (failed->token == latestLoadToken.load (std::memory_order_acquire)
+                && failed->kind == LoadKindRelink)
+            {
+                sampleMissing.store (true);
+                missingFilePath = failed->file.getFullPathName();
+                sampleData.setFileName (failed->file.getFileName());
+                sampleData.setFilePath (failed->file.getFullPathName());
+                sampleAvailability.store ((int) SampleStateMissingAwaitingRelink,
+                                         std::memory_order_relaxed);
+                loadStateChanged = true;
+            }
+        }
+    }
+
+    if (loadStateChanged)
+        updateHostDisplay (ChangeDetails().withNonParameterStateChanged (true));
+
     drainCommands();
+    publishUiSliceSnapshot();
 
     if (gestureSnapshotCaptured)
     {
@@ -775,7 +893,11 @@ void IntersectProcessor::processBlock (juce::AudioBuffer<float>& buffer,
     processMidi (midi);
 
     if (! sampleData.isLoaded())
+    {
+        if (! sampleMissing.load (std::memory_order_relaxed))
+            sampleAvailability.store ((int) SampleStateEmpty, std::memory_order_relaxed);
         return;
+    }
 
     // Collect write pointers for all enabled output buses
     static constexpr int kMaxBuses = 16;
@@ -948,42 +1070,53 @@ void IntersectProcessor::setStateInformation (const void* data, int sizeInBytes)
     int savedSelectedSlice = stream.readInt();
 
     midiSelectsSlice.store (stream.readBool());
-    sliceManager.rootNote.store (stream.readInt());
+    sliceManager.rootNote.store (juce::jlimit (0, 127, stream.readInt()));
 
     // Slice data
-    int numSlices = stream.readInt();
-    sliceManager.setNumSlices (numSlices);
-    sliceManager.selectedSlice = juce::jlimit (-1, numSlices - 1, savedSelectedSlice);
-    for (int i = 0; i < numSlices; ++i)
+    const int storedNumSlices = stream.readInt();
+    if (storedNumSlices < 0 || storedNumSlices > 4096)
+        return;
+
+    const int validatedNumSlices = juce::jlimit (0, SliceManager::kMaxSlices, storedNumSlices);
+    sliceManager.setNumSlices (validatedNumSlices);
+    sliceManager.selectedSlice = juce::jlimit (-1, validatedNumSlices - 1, savedSelectedSlice);
+
+    for (int i = 0; i < storedNumSlices; ++i)
     {
-        auto& s = sliceManager.getSlice (i);
-        s.active         = stream.readBool();
-        s.startSample    = stream.readInt();
-        s.endSample      = stream.readInt();
-        s.midiNote       = stream.readInt();
-        s.bpm            = stream.readFloat();
-        s.pitchSemitones = stream.readFloat();
-        s.algorithm      = stream.readInt();
-        s.attackSec      = stream.readFloat();
-        s.decaySec       = stream.readFloat();
-        s.sustainLevel   = stream.readFloat();
-        s.releaseSec     = stream.readFloat();
-        s.muteGroup      = stream.readInt();
-        s.loopMode       = stream.readInt();
-        s.stretchEnabled = stream.readBool();
-        s.lockMask       = (uint32_t) stream.readInt();
-        s.colour         = juce::Colour ((juce::uint32) stream.readInt());
-        s.tonalityHz      = stream.readFloat();
-        s.formantSemitones = stream.readFloat();
-        s.formantComp     = stream.readBool();
-        s.grainMode = stream.readInt();
-        s.volume = stream.readFloat();
-        s.releaseTail = stream.readBool();
-        s.reverse = stream.readBool();
-        s.outputBus = stream.readInt();
-        s.oneShot = stream.readBool();
-        s.centsDetune = stream.readFloat();
+        Slice parsed;
+        parsed.active         = stream.readBool();
+        parsed.startSample    = stream.readInt();
+        parsed.endSample      = stream.readInt();
+        parsed.midiNote       = stream.readInt();
+        parsed.bpm            = stream.readFloat();
+        parsed.pitchSemitones = stream.readFloat();
+        parsed.algorithm      = stream.readInt();
+        parsed.attackSec      = stream.readFloat();
+        parsed.decaySec       = stream.readFloat();
+        parsed.sustainLevel   = stream.readFloat();
+        parsed.releaseSec     = stream.readFloat();
+        parsed.muteGroup      = stream.readInt();
+        parsed.loopMode       = stream.readInt();
+        parsed.stretchEnabled = stream.readBool();
+        parsed.lockMask       = (uint32_t) stream.readInt();
+        parsed.colour         = juce::Colour ((juce::uint32) stream.readInt());
+        parsed.tonalityHz     = stream.readFloat();
+        parsed.formantSemitones = stream.readFloat();
+        parsed.formantComp    = stream.readBool();
+        parsed.grainMode      = stream.readInt();
+        parsed.volume         = stream.readFloat();
+        parsed.releaseTail    = stream.readBool();
+        parsed.reverse        = stream.readBool();
+        parsed.outputBus      = stream.readInt();
+        parsed.oneShot        = stream.readBool();
+        parsed.centsDetune    = stream.readFloat();
+
+        if (i < validatedNumSlices)
+            sliceManager.getSlice (i) = sanitiseRestoredSlice (parsed);
     }
+
+    for (int i = validatedNumSlices; i < SliceManager::kMaxSlices; ++i)
+        sliceManager.getSlice (i).active = false;
 
     // Path-based sample restore
     auto filePath = stream.readString();
@@ -993,26 +1126,49 @@ void IntersectProcessor::setStateInformation (const void* data, int sizeInBytes)
     {
         juce::File f (filePath);
         double sr = currentSampleRate > 0 ? currentSampleRate : 44100.0;
+        clearVoicesBeforeSampleSwap();
         if (f.existsAsFile() && sampleData.loadFromFile (f, sr))
         {
             sampleMissing.store (false);
             missingFilePath.clear();
+            sampleAvailability.store ((int) SampleStateLoaded, std::memory_order_relaxed);
+            const int maxLen = sampleData.getNumFrames();
+            if (maxLen > 1)
+            {
+                for (int i = 0; i < validatedNumSlices; ++i)
+                {
+                    auto& s = sliceManager.getSlice (i);
+                    s.startSample = juce::jlimit (0, maxLen - 1, s.startSample);
+                    s.endSample = juce::jlimit (s.startSample + 1, maxLen, s.endSample);
+                    if (s.endSample - s.startSample < 64)
+                        s.endSample = juce::jmin (maxLen, s.startSample + 64);
+                }
+            }
         }
         else
         {
+            sampleData.clear();
             sampleMissing.store (true);
             missingFilePath = filePath;
             sampleData.setFileName (fileName);
             sampleData.setFilePath (filePath);
+            sampleAvailability.store ((int) SampleStateMissingAwaitingRelink,
+                                     std::memory_order_relaxed);
         }
     }
     else
     {
+        clearVoicesBeforeSampleSwap();
+        sampleData.clear();
         sampleMissing.store (false);
         missingFilePath.clear();
+        sampleData.setFileName ({});
+        sampleData.setFilePath ({});
+        sampleAvailability.store ((int) SampleStateEmpty, std::memory_order_relaxed);
     }
 
     sliceManager.rebuildMidiMap();
+    publishUiSliceSnapshot();
 
     snapToZeroCrossing.store (stream.readBool());
 }

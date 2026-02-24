@@ -27,10 +27,10 @@ public:
     std::atomic<int> selectedSlice { -1 };
     std::atomic<int> rootNote { 36 };
 
-    void setSlicePalette (const juce::Colour* p) { palette = p; }
+    void setSlicePalette (const juce::Colour* p) { palette.store (p, std::memory_order_relaxed); }
 
 private:
-    const juce::Colour* palette = nullptr;
+    std::atomic<const juce::Colour*> palette { nullptr };
 
     std::array<Slice, kMaxSlices> slices;
     int numSlices = 0;

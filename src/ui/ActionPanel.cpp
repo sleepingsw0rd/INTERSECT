@@ -69,7 +69,8 @@ ActionPanel::ActionPanel (IntersectProcessor& p, WaveformView& wv)
     updateSnapButtonAppearance (false);
 
     deleteBtn.onClick = [this] {
-        int sel = processor.sliceManager.selectedSlice;
+        const auto& ui = processor.getUiSliceSnapshot();
+        int sel = ui.selectedSlice;
         if (sel >= 0)
         {
             IntersectProcessor::Command cmd;

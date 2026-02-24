@@ -60,8 +60,9 @@ void SliceControlBar::paint (juce::Graphics& g)
     g.fillAll (getTheme().darkBar);
     cells.clear();
 
-    int idx = processor.sliceManager.selectedSlice;
-    int numSlices = processor.sliceManager.getNumSlices();
+    const auto& ui = processor.getUiSliceSnapshot();
+    int idx = ui.selectedSlice;
+    int numSlices = ui.numSlices;
     int rightEdge = getWidth() - 8;  // 8px right margin matching content
 
     int row1y = 2;
@@ -70,7 +71,7 @@ void SliceControlBar::paint (juce::Graphics& g)
     // ====== Row 2 right side: always draw SLICES and ROOT ======
     {
         // ROOT note display (Row 2, right-aligned flush with rightEdge)
-        int rn = processor.sliceManager.rootNote.load();
+        int rn = ui.rootNote;
         bool editable = (numSlices == 0);
         int rnW = 55;
         int rnX = rightEdge - rnW;
@@ -104,7 +105,7 @@ void SliceControlBar::paint (juce::Graphics& g)
         return;
     }
 
-    const auto& s = processor.sliceManager.getSlice (idx);
+    const auto& s = ui.slices[(size_t) idx];
 
     // Global defaults for inheritance display
     float gBpm     = processor.apvts.getRawParameterValue (ParamIds::defaultBpm)->load();
@@ -366,9 +367,10 @@ void SliceControlBar::mouseDown (const juce::MouseEvent& e)
     activeDragCell = -1;
     draggingRootNote = false;
     auto pos = e.getPosition();
+    const auto& ui = processor.getUiSliceSnapshot();
 
     // Root note drag (only editable when no slices exist)
-    if (processor.sliceManager.getNumSlices() == 0 && rootNoteArea.contains (pos))
+    if (ui.numSlices == 0 && rootNoteArea.contains (pos))
     {
         IntersectProcessor::Command gestureCmd;
         gestureCmd.type = IntersectProcessor::CmdBeginGesture;
@@ -376,7 +378,7 @@ void SliceControlBar::mouseDown (const juce::MouseEvent& e)
 
         draggingRootNote = true;
         dragStartY = pos.y;
-        dragStartValue = (float) processor.sliceManager.rootNote.load();
+        dragStartValue = (float) ui.rootNote;
         return;
     }
 
@@ -414,10 +416,10 @@ void SliceControlBar::mouseDown (const juce::MouseEvent& e)
             // Boolean toggle (ping-pong, stretch)
             if (cell.isBoolean)
             {
-                int idx = processor.sliceManager.selectedSlice;
-                if (idx >= 0 && idx < processor.sliceManager.getNumSlices())
+                int idx = ui.selectedSlice;
+                if (idx >= 0 && idx < ui.numSlices)
                 {
-                    const auto& s = processor.sliceManager.getSlice (idx);
+                    const auto& s = ui.slices[(size_t) idx];
                     bool sliceLocked = s.lockMask & cell.lockBit;
 
                     bool currentVal = false;
@@ -460,10 +462,10 @@ void SliceControlBar::mouseDown (const juce::MouseEvent& e)
             // Choice: click to cycle
             if (cell.isChoice)
             {
-                int idx = processor.sliceManager.selectedSlice;
-                if (idx >= 0 && idx < processor.sliceManager.getNumSlices())
+                int idx = ui.selectedSlice;
+                if (idx >= 0 && idx < ui.numSlices)
                 {
-                    const auto& s = processor.sliceManager.getSlice (idx);
+                    const auto& s = ui.slices[(size_t) idx];
                     int current = 0;
                     int maxVal = (int) cell.maxVal;
 
@@ -504,10 +506,10 @@ void SliceControlBar::mouseDown (const juce::MouseEvent& e)
             dragStartY = pos.y;
 
             // Get current value
-            int idx = processor.sliceManager.selectedSlice;
-            if (idx >= 0 && idx < processor.sliceManager.getNumSlices())
+            int idx = ui.selectedSlice;
+            if (idx >= 0 && idx < ui.numSlices)
             {
-                const auto& s = processor.sliceManager.getSlice (idx);
+                const auto& s = ui.slices[(size_t) idx];
                 switch (cell.fieldId)
                 {
                     case IntersectProcessor::FieldBpm:
@@ -581,7 +583,10 @@ void SliceControlBar::mouseDrag (const juce::MouseEvent& e)
         float deltaY = (float) (dragStartY - e.y);
         int newVal = (int) (dragStartValue + deltaY * (127.0f / 200.0f));
         newVal = juce::jlimit (0, 127, newVal);
-        processor.sliceManager.rootNote.store (newVal);
+        IntersectProcessor::Command cmd;
+        cmd.type = IntersectProcessor::CmdSetRootNote;
+        cmd.intParam1 = newVal;
+        processor.pushCommand (cmd);
         repaint();
         return;
     }
@@ -658,9 +663,10 @@ void SliceControlBar::mouseDrag (const juce::MouseEvent& e)
 void SliceControlBar::mouseDoubleClick (const juce::MouseEvent& e)
 {
     auto pos = e.getPosition();
+    const auto& ui = processor.getUiSliceSnapshot();
 
     // Root note text entry (only when no slices)
-    if (processor.sliceManager.getNumSlices() == 0 && rootNoteArea.contains (pos))
+    if (ui.numSlices == 0 && rootNoteArea.contains (pos))
     {
         textEditor = std::make_unique<juce::TextEditor>();
         addAndMakeVisible (*textEditor);
@@ -670,14 +676,17 @@ void SliceControlBar::mouseDoubleClick (const juce::MouseEvent& e)
         textEditor->setColour (juce::TextEditor::backgroundColourId, getTheme().darkBar.brighter (0.15f));
         textEditor->setColour (juce::TextEditor::textColourId, getTheme().foreground);
         textEditor->setColour (juce::TextEditor::outlineColourId, getTheme().accent);
-        textEditor->setText (juce::String (processor.sliceManager.rootNote.load()), false);
+        textEditor->setText (juce::String (ui.rootNote), false);
         textEditor->selectAll();
         textEditor->grabKeyboardFocus();
 
         textEditor->onReturnKey = [this] {
             if (textEditor == nullptr) return;
             int val = juce::jlimit (0, 127, textEditor->getText().getIntValue());
-            processor.sliceManager.rootNote.store (val);
+            IntersectProcessor::Command cmd;
+            cmd.type = IntersectProcessor::CmdSetRootNote;
+            cmd.intParam1 = val;
+            processor.pushCommand (cmd);
             textEditor.reset();
             repaint();
         };
@@ -698,10 +707,10 @@ void SliceControlBar::mouseDoubleClick (const juce::MouseEvent& e)
 
             // Get current value
             float currentVal = 0.0f;
-            int idx = processor.sliceManager.selectedSlice;
-            if (idx >= 0 && idx < processor.sliceManager.getNumSlices())
+            int idx = ui.selectedSlice;
+            if (idx >= 0 && idx < ui.numSlices)
             {
-                const auto& s = processor.sliceManager.getSlice (idx);
+                const auto& s = ui.slices[(size_t) idx];
                 switch (cell.fieldId)
                 {
                     case IntersectProcessor::FieldBpm:

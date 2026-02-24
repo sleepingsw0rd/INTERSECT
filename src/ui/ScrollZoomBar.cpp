@@ -22,7 +22,8 @@ void ScrollZoomBar::paint (juce::Graphics& g)
     g.setColour (getTheme().separator);
     g.drawHorizontalLine (0, 0.0f, (float) w);
 
-    int numFrames = processor.sampleData.getNumFrames();
+    auto sampleSnap = processor.sampleData.getSnapshot();
+    int numFrames = sampleSnap ? sampleSnap->buffer.getNumSamples() : 0;
     if (numFrames <= 0 || w <= 0)
         return;
 

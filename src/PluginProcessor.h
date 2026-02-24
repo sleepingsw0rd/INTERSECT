@@ -61,12 +61,21 @@ public:
         CmdRedo,
         CmdBeginGesture,
         CmdPanic,
+        CmdSelectSlice,
+        CmdSetRootNote,
     };
 
     enum LoadKind
     {
         LoadKindReplace = 0,
         LoadKindRelink = 1,
+    };
+
+    enum SampleAvailabilityState
+    {
+        SampleStateEmpty = 0,
+        SampleStateLoaded,
+        SampleStateMissingAwaitingRelink,
     };
 
     // Param field identifiers for CmdSetSliceParam
@@ -108,6 +117,25 @@ public:
     };
 
     void pushCommand (Command cmd);
+    void loadFileAsync (const juce::File& file);
+    void relinkFileAsync (const juce::File& file);
+
+    struct UiSliceSnapshot
+    {
+        int numSlices = 0;
+        int selectedSlice = -1;
+        int rootNote = 36;
+        bool sampleLoaded = false;
+        bool sampleMissing = false;
+        int sampleNumFrames = 0;
+        juce::String sampleFileName;
+        std::array<Slice, SliceManager::kMaxSlices> slices {};
+    };
+
+    const UiSliceSnapshot& getUiSliceSnapshot() const
+    {
+        return uiSliceSnapshots[(size_t) uiSliceSnapshotIndex.load (std::memory_order_acquire)];
+    }
 
     // Public state for UI access
     SampleData     sampleData;
@@ -139,13 +167,27 @@ public:
     // Missing sample state (for relink UI)
     std::atomic<bool> sampleMissing { false };
     juce::String missingFilePath;
+    std::atomic<int> sampleAvailability { (int) SampleStateEmpty };
+
+    SampleAvailabilityState getSampleAvailabilityState() const
+    {
+        return (SampleAvailabilityState) sampleAvailability.load (std::memory_order_relaxed);
+    }
 
 private:
+    struct FailedLoadResult
+    {
+        int token = 0;
+        LoadKind kind = LoadKindReplace;
+        juce::File file;
+    };
+
     void drainCommands();
     void handleCommand (const Command& cmd);
     void processMidi (const juce::MidiBuffer& midi);
     void requestSampleLoad (const juce::File& file, LoadKind kind);
     void clearVoicesBeforeSampleSwap();
+    void publishUiSliceSnapshot();
     UndoManager::Snapshot makeSnapshot();
     void captureSnapshot();
     void restoreSnapshot (const UndoManager::Snapshot& snap);
@@ -166,6 +208,9 @@ private:
     std::atomic<int> latestLoadToken { 0 };
     std::atomic<int> latestLoadKind { (int) LoadKindReplace };
     std::atomic<SampleData::DecodedSample*> completedLoadData { nullptr };
+    std::atomic<FailedLoadResult*> completedLoadFailure { nullptr };
+    std::array<UiSliceSnapshot, 2> uiSliceSnapshots {};
+    std::atomic<int> uiSliceSnapshotIndex { 0 };
 
     bool heldNotes[128] = {};
 

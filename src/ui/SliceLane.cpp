@@ -8,17 +8,19 @@ void SliceLane::paint (juce::Graphics& g)
 {
     g.fillAll (getTheme().darkBar.brighter (0.04f));
 
-    int numFrames = processor.sampleData.getNumFrames();
+    auto sampleSnap = processor.sampleData.getSnapshot();
+    int numFrames = sampleSnap ? sampleSnap->buffer.getNumSamples() : 0;
     if (numFrames <= 0)
         return;
 
+    const auto& ui = processor.getUiSliceSnapshot();
     float z = processor.zoom.load();
     float sc = processor.scroll.load();
     int visLen = (int) (numFrames / z);
     int visStart = (int) (sc * (numFrames - visLen));
 
-    int sel = processor.sliceManager.selectedSlice;
-    int num = processor.sliceManager.getNumSlices();
+    int sel = ui.selectedSlice;
+    int num = ui.numSlices;
     int w = getWidth();
     int h = getHeight();
 
@@ -28,7 +30,7 @@ void SliceLane::paint (juce::Graphics& g)
 
     for (int i = 0; i < num; ++i)
     {
-        const auto& s = processor.sliceManager.getSlice (i);
+        const auto& s = ui.slices[(size_t) i];
         if (! s.active) continue;
         if (visLen <= 0) continue;
 
@@ -105,23 +107,25 @@ void SliceLane::paint (juce::Graphics& g)
 
 void SliceLane::mouseDown (const juce::MouseEvent& e)
 {
-    int numFrames = processor.sampleData.getNumFrames();
+    auto sampleSnap = processor.sampleData.getSnapshot();
+    int numFrames = sampleSnap ? sampleSnap->buffer.getNumSamples() : 0;
     if (numFrames <= 0)
         return;
 
+    const auto& ui = processor.getUiSliceSnapshot();
     float z = processor.zoom.load();
     float sc = processor.scroll.load();
     int visLen = (int) (numFrames / z);
     int visStart = (int) (sc * (numFrames - visLen));
     int w = getWidth();
-    int num = processor.sliceManager.getNumSlices();
+    int num = ui.numSlices;
 
     // Collect all overlapping slice indices at click position
     std::vector<int> overlapping;
 
     for (int i = 0; i < num; ++i)
     {
-        const auto& s = processor.sliceManager.getSlice (i);
+        const auto& s = ui.slices[(size_t) i];
         if (! s.active) continue;
 
         if (visLen <= 0) continue;
@@ -134,7 +138,8 @@ void SliceLane::mouseDown (const juce::MouseEvent& e)
 
     if (! overlapping.empty())
     {
-        int current = processor.sliceManager.selectedSlice;
+        int current = ui.selectedSlice;
+        int target = current;
 
         // If current selection is in the list, cycle to the next one
         auto it = std::find (overlapping.begin(), overlapping.end(), current);
@@ -143,11 +148,16 @@ void SliceLane::mouseDown (const juce::MouseEvent& e)
             ++it;
             if (it == overlapping.end())
                 it = overlapping.begin();
-            processor.sliceManager.selectedSlice = *it;
+            target = *it;
         }
         else
         {
-            processor.sliceManager.selectedSlice = overlapping.front();
+            target = overlapping.front();
         }
+
+        IntersectProcessor::Command cmd;
+        cmd.type = IntersectProcessor::CmdSelectSlice;
+        cmd.intParam1 = target;
+        processor.pushCommand (cmd);
     }
 }

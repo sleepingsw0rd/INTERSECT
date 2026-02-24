@@ -177,7 +177,8 @@ bool IntersectEditor::keyPressed (const juce::KeyPress& key)
     // Delete / Backspace — Delete Slice
     if (code == juce::KeyPress::deleteKey || code == juce::KeyPress::backspaceKey)
     {
-        int sel = processor.sliceManager.selectedSlice;
+        const auto& ui = processor.getUiSliceSnapshot();
+        int sel = ui.selectedSlice;
         if (sel >= 0)
         {
             IntersectProcessor::Command cmd;
@@ -210,11 +211,15 @@ bool IntersectEditor::keyPressed (const juce::KeyPress& key)
     if (code == juce::KeyPress::rightKey
         || (code == juce::KeyPress::tabKey && ! mods.isShiftDown()))
     {
-        int sel = processor.sliceManager.selectedSlice;
-        int num = processor.sliceManager.getNumSlices();
+        const auto& ui = processor.getUiSliceSnapshot();
+        int sel = ui.selectedSlice;
+        int num = ui.numSlices;
         if (num > 0)
         {
-            processor.sliceManager.selectedSlice = juce::jlimit (0, num - 1, sel + 1);
+            IntersectProcessor::Command cmd;
+            cmd.type = IntersectProcessor::CmdSelectSlice;
+            cmd.intParam1 = juce::jlimit (0, num - 1, sel + 1);
+            processor.pushCommand (cmd);
             repaint();
         }
         return true;
@@ -224,11 +229,15 @@ bool IntersectEditor::keyPressed (const juce::KeyPress& key)
     if (code == juce::KeyPress::leftKey
         || (code == juce::KeyPress::tabKey && mods.isShiftDown()))
     {
-        int sel = processor.sliceManager.selectedSlice;
-        int num = processor.sliceManager.getNumSlices();
+        const auto& ui = processor.getUiSliceSnapshot();
+        int sel = ui.selectedSlice;
+        int num = ui.numSlices;
         if (num > 0)
         {
-            processor.sliceManager.selectedSlice = juce::jlimit (0, num - 1, sel - 1);
+            IntersectProcessor::Command cmd;
+            cmd.type = IntersectProcessor::CmdSelectSlice;
+            cmd.intParam1 = juce::jlimit (0, num - 1, sel - 1);
+            processor.pushCommand (cmd);
             repaint();
         }
         return true;

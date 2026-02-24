@@ -41,7 +41,8 @@ int SliceManager::createSlice (int start, int end)
     s.loopMode       = 0;
 
     // Assign colour from palette
-    s.colour = palette ? palette[idx % 16] : juce::Colour (0xFF4D8C99);
+    const auto* p = palette.load (std::memory_order_relaxed);
+    s.colour = p ? p[idx % 16] : juce::Colour (0xFF4D8C99);
 
     numSlices++;
     rebuildMidiMap();

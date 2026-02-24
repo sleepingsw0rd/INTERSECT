@@ -93,7 +93,9 @@ void HeaderBar::paint (juce::Graphics& g)
     g.fillAll (getTheme().header);
     headerCells.clear();
 
-    if (processor.sampleData.isLoaded())
+    const auto& ui = processor.getUiSliceSnapshot();
+
+    if (ui.sampleLoaded)
     {
         // --- Row 1: BPM | SET BPM | PITCH | ALGO | TONAL | FMNT | FMNT C | filename | scale btns ---
         g.setFont (IntersectLookAndFeel::makeFont (14.0f));
@@ -287,7 +289,7 @@ void HeaderBar::paint (juce::Graphics& g)
         // Filename and sample info (right-aligned, left of UNDO button)
         {
             int rightEdge = undoBtn.getX() - 6;
-            bool isMissing = processor.sampleMissing.load();
+            bool isMissing = ui.sampleMissing;
 
             g.setFont (IntersectLookAndFeel::makeFont (12.0f));
             if (isMissing)
@@ -302,7 +304,7 @@ void HeaderBar::paint (juce::Graphics& g)
             else
                 g.setColour (getTheme().foreground.withAlpha (0.7f));
 
-            juce::String fname = processor.sampleData.getFileName();
+            juce::String fname = ui.sampleFileName;
             if (isMissing)
             {
                 g.drawText (fname + " (click to relink)", x, row1y + 15, rightEdge - x, 14, juce::Justification::right);
@@ -311,7 +313,7 @@ void HeaderBar::paint (juce::Graphics& g)
             {
                 double srate = processor.getSampleRate();
                 if (srate <= 0) srate = 44100.0;
-                double lenSec = processor.sampleData.getNumFrames() / srate;
+                double lenSec = ui.sampleNumFrames / srate;
                 g.drawText (fname + " (" + juce::String (lenSec, 2) + "s)",
                             x, row1y + 15, rightEdge - x, 14, juce::Justification::right);
             }
@@ -439,7 +441,7 @@ void HeaderBar::paint (juce::Graphics& g)
             headerCells.push_back ({ voicesX, row2y, voicesW, row2h, ParamIds::maxVoices, 1.0f, 31.0f, 1.0f, false, false, false, false });
         }
     }
-    else if (processor.sampleMissing.load())
+    else if (ui.sampleMissing)
     {
         // Sample is missing — show MISSING indicator with filename
         g.setColour (juce::Colours::white.withAlpha (0.8f));
@@ -453,7 +455,7 @@ void HeaderBar::paint (juce::Graphics& g)
 
         g.setFont (IntersectLookAndFeel::makeFont (14.0f));
         g.setColour (juce::Colours::orange.withAlpha (0.9f));
-        juce::String fname = processor.sampleData.getFileName();
+        juce::String fname = ui.sampleFileName;
         g.drawText (fname + " (click to relink)", 180, 16, rightEdge - 180, 14, juce::Justification::right);
 
         sampleInfoBounds = { 180, 2, rightEdge - 180, 28 };
@@ -478,13 +480,14 @@ void HeaderBar::mouseDown (const juce::MouseEvent& e)
     if (textEditor != nullptr)
         textEditor.reset();
 
+    const auto& ui = processor.getUiSliceSnapshot();
     activeDragCell = -1;
     auto pos = e.getPosition();
 
     // Click on sample info area opens file browser (relink if missing)
     if (sampleInfoBounds.contains (pos))
     {
-        if (processor.sampleMissing.load())
+        if (ui.sampleMissing)
             openRelinkBrowser();
         else
             openFileBrowser();
@@ -681,14 +684,16 @@ void HeaderBar::showSetBpmPopup (bool forSampleDefault)
         [this, forSampleDefault] (int result) {
             if (result <= 0 || result > 9) return;
             const float bars[] = { 0.0f, 16.0f, 8.0f, 4.0f, 2.0f, 1.0f, 0.5f, 0.25f, 0.125f, 0.0625f };
+            auto sampleSnap = processor.sampleData.getSnapshot();
+            const auto& ui = processor.getUiSliceSnapshot();
 
             // Determine start/end from selected slice or full sample
             int startS = 0;
-            int endS = processor.sampleData.getNumFrames();
-            int sel = processor.sliceManager.selectedSlice;
-            if (sel >= 0 && sel < processor.sliceManager.getNumSlices())
+            int endS = sampleSnap != nullptr ? sampleSnap->buffer.getNumSamples() : 0;
+            int sel = ui.selectedSlice;
+            if (sel >= 0 && sel < ui.numSlices)
             {
-                const auto& s = processor.sliceManager.getSlice (sel);
+                const auto& s = ui.slices[(size_t) sel];
                 startS = s.startSample;
                 endS = s.endSample;
             }
@@ -764,10 +769,7 @@ void HeaderBar::openFileBrowser()
             auto result = fc.getResult();
             if (result.existsAsFile())
             {
-                IntersectProcessor::Command cmd;
-                cmd.type = IntersectProcessor::CmdLoadFile;
-                cmd.fileParam = result;
-                processor.pushCommand (cmd);
+                processor.loadFileAsync (result);
                 processor.zoom.store (1.0f);
                 processor.scroll.store (0.0f);
             }
@@ -788,10 +790,7 @@ void HeaderBar::openRelinkBrowser()
             auto result = fc.getResult();
             if (result.existsAsFile())
             {
-                IntersectProcessor::Command cmd;
-                cmd.type = IntersectProcessor::CmdRelinkFile;
-                cmd.fileParam = result;
-                processor.pushCommand (cmd);
+                processor.relinkFileAsync (result);
             }
         });
 }

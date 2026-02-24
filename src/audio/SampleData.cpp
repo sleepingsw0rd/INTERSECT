@@ -1,6 +1,7 @@
 #include "SampleData.h"
 #include <algorithm>
 #include <cmath>
+#include <memory>
 
 namespace
 {
@@ -121,6 +122,13 @@ void SampleData::applyDecodedSample (std::unique_ptr<DecodedSample> decoded)
     peakMipmaps = std::move (decoded->peakMipmaps);
     loadedFileName = decoded->fileName;
     loadedFilePath = decoded->filePath;
+    auto view = std::make_shared<DecodedSample>();
+    view->buffer = buffer;
+    view->peakMipmaps = peakMipmaps;
+    view->fileName = loadedFileName;
+    view->filePath = loadedFilePath;
+    snapshot.store (std::static_pointer_cast<const DecodedSample> (view),
+                    std::memory_order_release);
     loaded = true;
 }
 
@@ -131,6 +139,26 @@ bool SampleData::loadFromFile (const juce::File& file, double projectSampleRate)
         return false;
     applyDecodedSample (std::move (decoded));
     return true;
+}
+
+void SampleData::clear()
+{
+    buffer.setSize (2, 0, false, false, true);
+    for (auto& m : peakMipmaps)
+    {
+        m.samplesPerPeak = 0;
+        m.maxPeaks.clear();
+        m.minPeaks.clear();
+    }
+    snapshot.store (std::shared_ptr<const DecodedSample> {}, std::memory_order_release);
+    loadedFileName.clear();
+    loadedFilePath.clear();
+    loaded = false;
+}
+
+SampleData::SnapshotPtr SampleData::getSnapshot() const
+{
+    return snapshot.load (std::memory_order_acquire);
 }
 
 float SampleData::getInterpolatedSample (double pos, int channel) const

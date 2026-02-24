@@ -32,20 +32,6 @@ A nondestructive, time-stretching, and intersecting sample slicer plugin with in
 - **Custom theming** - Dark, light, and custom themes.
 - **DAW transport stop handling** - Responds to All Notes Off (CC 123) and All Sound Off (CC 120), including one-shot-safe behavior.
 
-## What's New in v0.8.8 (Since v0.8.7)
-
-- Added async sample decode/loading and safer sample-swap handling.
-- Added **TUNE** (cents detune) at sample and slice levels.
-- In **Repitch + Stretch** mode, BPM now drives both **PITCH** and **TUNE** displays (read-only).
-- Added non-destructive slice move/resize previews, plus `Ctrl+drag` duplicate ghost overlays.
-- Added `Shift+click` waveform preview and a dedicated **PANIC** button.
-- Drag stepping updates: BPM/ATK/DEC/SUS/REL now step by `1`, or `5` while holding `Shift`.
-
-### Potentially Breaking Changes in v0.8.8
-
-- Project state is now **v16-only**. Older saved states are not loaded.
-- Max playable voices is now **31** (one voice is permanently reserved for preview playback).
-
 ## Install
 
 Download the latest release zip for your platform from the [Releases](https://github.com/tucktuckg00se/INTERSECT/releases) page and extract it.

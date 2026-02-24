@@ -7,7 +7,8 @@ WaveformView::WaveformView (IntersectProcessor& p) : processor (p) {}
 
 int WaveformView::pixelToSample (int px) const
 {
-    int numFrames = processor.sampleData.getNumFrames();
+    auto sampleSnap = processor.sampleData.getSnapshot();
+    int numFrames = sampleSnap ? sampleSnap->buffer.getNumSamples() : 0;
     float z = std::max (1.0f, processor.zoom.load());
     float sc = processor.scroll.load();
     int visLen = (int) (numFrames / z);
@@ -18,7 +19,8 @@ int WaveformView::pixelToSample (int px) const
 
 int WaveformView::sampleToPixel (int sample) const
 {
-    int numFrames = processor.sampleData.getNumFrames();
+    auto sampleSnap = processor.sampleData.getSnapshot();
+    int numFrames = sampleSnap ? sampleSnap->buffer.getNumSamples() : 0;
     float z = std::max (1.0f, processor.zoom.load());
     float sc = processor.scroll.load();
     int visLen = (int) (numFrames / z);
@@ -29,15 +31,15 @@ int WaveformView::sampleToPixel (int sample) const
 
 void WaveformView::rebuildCacheIfNeeded()
 {
+    auto sampleSnap = processor.sampleData.getSnapshot();
     float z = processor.zoom.load();
     float sc = processor.scroll.load();
     int w = getWidth();
-    int numFrames = processor.sampleData.getNumFrames();
+    int numFrames = sampleSnap ? sampleSnap->buffer.getNumSamples() : 0;
     if (z != prevZoom || sc != prevScroll || w != prevWidth || numFrames != prevNumFrames)
     {
-        if (processor.sampleData.isLoaded())
-            cache.rebuild (processor.sampleData.getBuffer(), processor.sampleData.getMipmaps(),
-                           numFrames, z, sc, w);
+        if (sampleSnap != nullptr)
+            cache.rebuild (sampleSnap->buffer, sampleSnap->peakMipmaps, numFrames, z, sc, w);
         prevZoom = z;
         prevScroll = sc;
         prevWidth = w;
@@ -47,6 +49,7 @@ void WaveformView::rebuildCacheIfNeeded()
 
 void WaveformView::paint (juce::Graphics& g)
 {
+    auto sampleSnap = processor.sampleData.getSnapshot();
     g.fillAll (getTheme().waveformBg);
 
     // Grid lines
@@ -57,7 +60,7 @@ void WaveformView::paint (juce::Graphics& g)
     g.drawHorizontalLine (getHeight() / 4, 0.0f, (float) getWidth());
     g.drawHorizontalLine (getHeight() * 3 / 4, 0.0f, (float) getWidth());
 
-    if (processor.sampleData.isLoaded())
+    if (sampleSnap != nullptr)
     {
         rebuildCacheIfNeeded();
         drawWaveform (g);
@@ -163,7 +166,8 @@ void WaveformView::drawWaveform (juce::Graphics& g)
         return;
 
     // Determine if we're in sub-sample zoom (peaks are single points, not ranges)
-    int numFrames = processor.sampleData.getNumFrames();
+    auto sampleSnap = processor.sampleData.getSnapshot();
+    int numFrames = sampleSnap ? sampleSnap->buffer.getNumSamples() : 0;
     float z = processor.zoom.load();
     int visLen = (int) (numFrames / z);
     float samplesPerPixel = (visLen > 0 && getWidth() > 0) ? (float) visLen / (float) getWidth() : 1.0f;
@@ -246,12 +250,13 @@ void WaveformView::drawWaveform (juce::Graphics& g)
 
 void WaveformView::drawSlices (juce::Graphics& g)
 {
-    int sel = processor.sliceManager.selectedSlice;
-    int num = processor.sliceManager.getNumSlices();
+    const auto& ui = processor.getUiSliceSnapshot();
+    int sel = ui.selectedSlice;
+    int num = ui.numSlices;
 
     for (int i = 0; i < num; ++i)
     {
-        const auto& s = processor.sliceManager.getSlice (i);
+        const auto& s = ui.slices[(size_t) i];
         if (! s.active) continue;
 
         int drawStartSample = s.startSample;
@@ -358,14 +363,16 @@ void WaveformView::resized()
 
 void WaveformView::mouseMove (const juce::MouseEvent& e)
 {
-    if (! processor.sampleData.isLoaded()) return;
-    int sel = processor.sliceManager.selectedSlice;
-    int num = processor.sliceManager.getNumSlices();
+    auto sampleSnap = processor.sampleData.getSnapshot();
+    if (sampleSnap == nullptr) return;
+    const auto& ui = processor.getUiSliceSnapshot();
+    int sel = ui.selectedSlice;
+    int num = ui.numSlices;
     HoveredEdge newEdge = HoveredEdge::None;
 
     if (sel >= 0 && sel < num && ! sliceDrawMode && ! altModeActive)
     {
-        const auto& s = processor.sliceManager.getSlice (sel);
+        const auto& s = ui.slices[(size_t) sel];
         if (s.active)
         {
             int x1 = sampleToPixel (s.startSample);
@@ -403,7 +410,8 @@ void WaveformView::modifierKeysChanged (const juce::ModifierKeys& mods)
 
 void WaveformView::mouseDown (const juce::MouseEvent& e)
 {
-    if (! processor.sampleData.isLoaded())
+    auto sampleSnap = processor.sampleData.getSnapshot();
+    if (sampleSnap == nullptr)
         return;
 
     // Middle-mouse drag: scroll+zoom (like ScrollZoomBar)
@@ -425,11 +433,11 @@ void WaveformView::mouseDown (const juce::MouseEvent& e)
         return;
     }
 
-    int samplePos = std::max (0, std::min (pixelToSample (e.x), processor.sampleData.getNumFrames()));
+    int samplePos = std::max (0, std::min (pixelToSample (e.x), sampleSnap->buffer.getNumSamples()));
 
     // Shift+click: preview audio from pointer position
     if (e.mods.isShiftDown() && ! sliceDrawMode && ! altModeActive
-        && ! processor.lazyChop.isActive() && processor.sampleData.isLoaded())
+        && ! processor.lazyChop.isActive())
     {
         shiftPreviewActive = true;
         processor.shiftPreviewRequest.store (samplePos, std::memory_order_relaxed);
@@ -445,12 +453,13 @@ void WaveformView::mouseDown (const juce::MouseEvent& e)
     }
 
     // Check slice edges (6px hot zone) — only for already-selected slice
-    int sel = processor.sliceManager.selectedSlice;
-    int num = processor.sliceManager.getNumSlices();
+    const auto& ui = processor.getUiSliceSnapshot();
+    int sel = ui.selectedSlice;
+    int num = ui.numSlices;
 
     if (sel >= 0 && sel < num)
     {
-        const auto& s = processor.sliceManager.getSlice (sel);
+        const auto& s = ui.slices[(size_t) sel];
         if (s.active)
         {
             int x1 = sampleToPixel (s.startSample);
@@ -509,7 +518,8 @@ void WaveformView::mouseDown (const juce::MouseEvent& e)
 
 void WaveformView::mouseDrag (const juce::MouseEvent& e)
 {
-    if (! processor.sampleData.isLoaded())
+    auto sampleSnap = processor.sampleData.getSnapshot();
+    if (sampleSnap == nullptr)
         return;
 
     // Middle-mouse drag: scroll+zoom
@@ -536,7 +546,7 @@ void WaveformView::mouseDrag (const juce::MouseEvent& e)
         return;
     }
 
-    int samplePos = std::max (0, std::min (pixelToSample (e.x), processor.sampleData.getNumFrames()));
+    int samplePos = std::max (0, std::min (pixelToSample (e.x), sampleSnap->buffer.getNumSamples()));
 
     if (dragMode == DrawSlice)
     {
@@ -547,15 +557,15 @@ void WaveformView::mouseDrag (const juce::MouseEvent& e)
 
     if (dragMode == DragEdgeLeft && dragSliceIdx >= 0)
     {
-        if (processor.snapToZeroCrossing.load() && processor.sampleData.isLoaded())
-            samplePos = AudioAnalysis::findNearestZeroCrossing (processor.sampleData.getBuffer(), samplePos);
+        if (processor.snapToZeroCrossing.load())
+            samplePos = AudioAnalysis::findNearestZeroCrossing (sampleSnap->buffer, samplePos);
         dragPreviewStart = std::min (samplePos, dragPreviewEnd - 64);
         repaint();
     }
     else if (dragMode == DragEdgeRight && dragSliceIdx >= 0)
     {
-        if (processor.snapToZeroCrossing.load() && processor.sampleData.isLoaded())
-            samplePos = AudioAnalysis::findNearestZeroCrossing (processor.sampleData.getBuffer(), samplePos);
+        if (processor.snapToZeroCrossing.load())
+            samplePos = AudioAnalysis::findNearestZeroCrossing (sampleSnap->buffer, samplePos);
         dragPreviewEnd = std::max (samplePos, dragPreviewStart + 64);
         repaint();
     }
@@ -565,7 +575,7 @@ void WaveformView::mouseDrag (const juce::MouseEvent& e)
         int newEnd = newStart + dragSliceLen;
 
         // Clamp to sample bounds
-        int maxLen = processor.sampleData.getNumFrames();
+        int maxLen = sampleSnap->buffer.getNumSamples();
         if (newStart < 0) { newStart = 0; newEnd = dragSliceLen; }
         if (newEnd > maxLen) { newEnd = maxLen; newStart = maxLen - dragSliceLen; }
 
@@ -575,7 +585,7 @@ void WaveformView::mouseDrag (const juce::MouseEvent& e)
     }
     else if (dragMode == DuplicateSlice && dragSliceIdx >= 0)
     {
-        int maxLen   = processor.sampleData.getNumFrames();
+        int maxLen   = sampleSnap->buffer.getNumSamples();
         int newStart = juce::jlimit (0, maxLen - dragSliceLen, samplePos - dragOffset);
         ghostStart   = newStart;
         ghostEnd     = newStart + dragSliceLen;
@@ -585,6 +595,8 @@ void WaveformView::mouseDrag (const juce::MouseEvent& e)
 
 void WaveformView::mouseUp (const juce::MouseEvent& e)
 {
+    auto sampleSnap = processor.sampleData.getSnapshot();
+
     // Stop shift preview
     if (shiftPreviewActive)
     {
@@ -601,11 +613,12 @@ void WaveformView::mouseUp (const juce::MouseEvent& e)
 
     if (dragMode == DrawSlice)
     {
-        int endPos = std::max (0, std::min (pixelToSample (e.x), processor.sampleData.getNumFrames()));
-        if (processor.snapToZeroCrossing.load() && processor.sampleData.isLoaded())
+        const int maxFrames = sampleSnap ? sampleSnap->buffer.getNumSamples() : 0;
+        int endPos = std::max (0, std::min (pixelToSample (e.x), maxFrames));
+        if (sampleSnap != nullptr && processor.snapToZeroCrossing.load())
         {
-            drawStart = AudioAnalysis::findNearestZeroCrossing (processor.sampleData.getBuffer(), drawStart);
-            endPos = AudioAnalysis::findNearestZeroCrossing (processor.sampleData.getBuffer(), endPos);
+            drawStart = AudioAnalysis::findNearestZeroCrossing (sampleSnap->buffer, drawStart);
+            endPos = AudioAnalysis::findNearestZeroCrossing (sampleSnap->buffer, endPos);
         }
         if (std::abs (endPos - drawStart) >= 64)
         {
@@ -637,10 +650,9 @@ void WaveformView::mouseUp (const juce::MouseEvent& e)
     }
     else if (dragMode == DuplicateSlice)
     {
-        if (processor.snapToZeroCrossing.load())
+        if (sampleSnap != nullptr && processor.snapToZeroCrossing.load())
         {
-            ghostStart = AudioAnalysis::findNearestZeroCrossing (
-                processor.sampleData.getBuffer(), ghostStart);
+            ghostStart = AudioAnalysis::findNearestZeroCrossing (sampleSnap->buffer, ghostStart);
             ghostEnd   = ghostStart + dragSliceLen;
         }
         IntersectProcessor::Command cmd;
@@ -724,10 +736,7 @@ void WaveformView::filesDropped (const juce::StringArray& files, int, int)
 {
     if (! files.isEmpty())
     {
-        IntersectProcessor::Command cmd;
-        cmd.type = IntersectProcessor::CmdLoadFile;
-        cmd.fileParam = juce::File (files[0]);
-        processor.pushCommand (cmd);
+        processor.loadFileAsync (juce::File (files[0]));
         processor.zoom.store (1.0f);
         processor.scroll.store (0.0f);
         prevWidth = -1;

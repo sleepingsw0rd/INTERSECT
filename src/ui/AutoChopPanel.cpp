@@ -152,26 +152,27 @@ void AutoChopPanel::resized()
 
 void AutoChopPanel::updatePreview()
 {
-    int sel = processor.sliceManager.selectedSlice;
-    if (sel < 0 || sel >= processor.sliceManager.getNumSlices()
-        || ! processor.sampleData.isLoaded())
+    auto sampleSnap = processor.sampleData.getSnapshot();
+    const auto& ui = processor.getUiSliceSnapshot();
+    int sel = ui.selectedSlice;
+    if (sel < 0 || sel >= ui.numSlices || sampleSnap == nullptr)
     {
         waveformView.transientPreviewPositions.clear();
         waveformView.repaint();
         return;
     }
 
-    const auto& s = processor.sliceManager.getSlice (sel);
+    const auto& s = ui.slices[(size_t) sel];
     float sens = (float) sensitivitySlider.getValue() / 100.0f;
 
     auto positions = AudioAnalysis::detectTransients (
-        processor.sampleData.getBuffer(), s.startSample, s.endSample, sens, processor.getSampleRate());
+        sampleSnap->buffer, s.startSample, s.endSample, sens, processor.getSampleRate());
 
     if (processor.snapToZeroCrossing.load())
     {
         std::transform (positions.begin(), positions.end(), positions.begin(),
-                        [this] (int p) { return AudioAnalysis::findNearestZeroCrossing (
-                            processor.sampleData.getBuffer(), p); });
+                        [sampleSnap] (int p) { return AudioAnalysis::findNearestZeroCrossing (
+                            sampleSnap->buffer, p); });
     }
 
     waveformView.transientPreviewPositions = std::move (positions);
