@@ -773,7 +773,7 @@ void HeaderBar::openFileBrowser()
     fileChooser = std::make_unique<juce::FileChooser> (
         "Load Audio File",
         juce::File(),
-        "*.wav;*.ogg;*.aiff;*.flac;*.mp3");
+        "*.wav;*.ogg;*.aiff;*.aif;*.flac;*.mp3");
 
     fileChooser->launchAsync (juce::FileBrowserComponent::openMode
                                 | juce::FileBrowserComponent::canSelectFiles,
@@ -794,7 +794,7 @@ void HeaderBar::openRelinkBrowser()
     fileChooser = std::make_unique<juce::FileChooser> (
         "Relink Audio File",
         juce::File(),
-        "*.wav;*.ogg;*.aiff;*.flac;*.mp3");
+        "*.wav;*.ogg;*.aiff;*.aif;*.flac;*.mp3");
 
     fileChooser->launchAsync (juce::FileBrowserComponent::openMode
                                 | juce::FileBrowserComponent::canSelectFiles,

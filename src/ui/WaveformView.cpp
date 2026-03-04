@@ -943,7 +943,7 @@ bool WaveformView::isInterestedInFileDrag (const juce::StringArray& files)
     for (auto& f : files)
     {
         auto ext = juce::File (f).getFileExtension().toLowerCase();
-        if (ext == ".wav" || ext == ".ogg" || ext == ".aiff" || ext == ".flac" || ext == ".mp3")
+        if (ext == ".wav" || ext == ".ogg" || ext == ".aiff" || ext == ".aif" || ext == ".flac" || ext == ".mp3")
             return true;
     }
     return false;
